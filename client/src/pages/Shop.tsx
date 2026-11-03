@@ -1,0 +1,250 @@
+import { useEffect, useState } from "react";
+import { fetchProducts } from "../api/products";
+import { SearchIcon, CloseIcon } from "../components/icons/Icon";
+import { MetalPricesPanel } from "../components/metals/MetalPricesPanel";
+import { Pagination } from "../components/common/Pagination";
+import { ProductCard } from "../components/product/ProductCard";
+import { ProductGridSkeleton } from "../components/common/Skeleton";
+import { Breadcrumbs } from "../components/common/Breadcrumbs";
+import { useDebouncedValue } from "../hooks/useDebouncedValue";
+import { useToast } from "../context/ToastContext";
+import type { Category, MetalType, Product } from "../types";
+
+const CATEGORIES: Category[] = ["RING", "NECKLACE", "BRACELET", "EARRING"];
+const METALS: MetalType[] = ["GOLD", "SILVER"];
+const PAGE_SIZE = 24;
+
+const SORT_OPTIONS = [
+  { value: "newest", label: "Newest" },
+  { value: "price-asc", label: "Price: low to high" },
+  { value: "price-desc", label: "Price: high to low" },
+  { value: "weight-asc", label: "Weight: low to high" },
+  { value: "weight-desc", label: "Weight: high to low" },
+] as const;
+type SortValue = (typeof SORT_OPTIONS)[number]["value"];
+
+function titleCase(value: string) {
+  return value.charAt(0) + value.slice(1).toLowerCase();
+}
+
+/** Product listing page with search, category/metal filters, a price-range filter, sorting and pagination, re-fetching results whenever a filter/page changes. */
+export function Shop() {
+  const { showToast } = useToast();
+  const [products, setProducts] = useState<Product[]>([]);
+  const [total, setTotal] = useState(0);
+  const [category, setCategory] = useState<Category | "">("");
+  const [metalType, setMetalType] = useState<MetalType | "">("");
+  const [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search, 300);
+  const [minPrice, setMinPrice] = useState("");
+  const [maxPrice, setMaxPrice] = useState("");
+  const [sort, setSort] = useState<SortValue>("newest");
+  const [page, setPage] = useState(1);
+  const [isLoading, setIsLoading] = useState(true);
+  const [hasLoaded, setHasLoaded] = useState(false);
+  const [isFilterOpen, setIsFilterOpen] = useState(false);
+
+  // Reset back to page 1 whenever a filter (not the page itself) changes.
+  useEffect(() => {
+    setPage(1);
+  }, [category, metalType, debouncedSearch, minPrice, maxPrice, sort]);
+
+  useEffect(() => {
+    setIsLoading(true);
+    const [sortBy, sortOrder] = sort === "newest" ? [undefined, undefined] : (sort.split("-") as ["price" | "weight", "asc" | "desc"]);
+    const minPriceCents = minPrice ? Math.round(Number(minPrice) * 100) : undefined;
+    const maxPriceCents = maxPrice ? Math.round(Number(maxPrice) * 100) : undefined;
+    fetchProducts({
+      productType: "JEWELRY",
+      category: category || undefined,
+      metalType: metalType || undefined,
+      search: debouncedSearch || undefined,
+      minPriceCents: minPriceCents !== undefined && !Number.isNaN(minPriceCents) ? minPriceCents : undefined,
+      maxPriceCents: maxPriceCents !== undefined && !Number.isNaN(maxPriceCents) ? maxPriceCents : undefined,
+      sortBy,
+      sortOrder,
+      page,
+      pageSize: PAGE_SIZE,
+    })
+      .then((res) => {
+        setProducts(res.items);
+        setTotal(res.total);
+      })
+      .catch(() => {
+        showToast("Couldn't load products. Try again.", "error");
+      })
+      .finally(() => {
+        setIsLoading(false);
+        setHasLoaded(true);
+      });
+  }, [category, metalType, debouncedSearch, minPrice, maxPrice, sort, page, showToast]);
+
+  const chips: { key: string; label: string; onClear: () => void }[] = [];
+  if (category) chips.push({ key: "category", label: `Category: ${titleCase(category)}`, onClear: () => setCategory("") });
+  if (metalType) chips.push({ key: "metalType", label: `Metal: ${titleCase(metalType)}`, onClear: () => setMetalType("") });
+  if (search) chips.push({ key: "search", label: `Search: "${search}"`, onClear: () => setSearch("") });
+  if (minPrice || maxPrice) {
+    const label =
+      minPrice && maxPrice
+        ? `Price: $${minPrice}–$${maxPrice}`
+        : minPrice
+          ? `Price: min $${minPrice}`
+          : `Price: max $${maxPrice}`;
+    chips.push({
+      key: "price",
+      label,
+      onClear: () => {
+        setMinPrice("");
+        setMaxPrice("");
+      },
+    });
+  }
+
+  function clearAllFilters() {
+    setCategory("");
+    setMetalType("");
+    setSearch("");
+    setMinPrice("");
+    setMaxPrice("");
+  }
+
+  return (
+    <div className="mx-auto max-w-6xl px-4 py-10 sm:px-6 lg:px-8">
+      <Breadcrumbs items={[{ label: "Home", to: "/" }, { label: "Shop" }]} />
+      <h1 className="mt-2 font-serif text-3xl text-ink-900 sm:text-4xl">Shop the jewelry collection</h1>
+
+      <div className="mt-4">
+        <MetalPricesPanel variant="compact" />
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setIsFilterOpen((v) => !v)}
+        aria-expanded={isFilterOpen}
+        aria-controls="shop-filters"
+        className="mt-6 flex min-h-11 w-full items-center justify-between gap-2 rounded-lg border border-brand-300 bg-white px-4 py-2.5 text-sm font-medium text-ink-900 sm:hidden"
+      >
+        Filters
+        <span aria-hidden="true" className={`transition-transform ${isFilterOpen ? "rotate-180" : ""}`}>
+          &#9662;
+        </span>
+      </button>
+
+      <div
+        id="shop-filters"
+        className={`mt-3 flex-wrap items-center gap-3 sm:mt-6 sm:flex ${isFilterOpen ? "flex" : "hidden"}`}
+      >
+        <div className="relative">
+          <SearchIcon className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-900/40" />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search products..."
+            className="rounded-full border border-brand-300 py-2 pl-9 pr-4 text-sm focus:border-brand-500 focus:outline-none"
+          />
+        </div>
+        <select
+          value={category}
+          onChange={(e) => setCategory(e.target.value as Category | "")}
+          className="rounded-full border border-brand-300 px-4 py-2 text-sm"
+        >
+          <option value="">All categories</option>
+          {CATEGORIES.map((c) => (
+            <option key={c} value={c}>{titleCase(c)}</option>
+          ))}
+        </select>
+        <select
+          value={metalType}
+          onChange={(e) => setMetalType(e.target.value as MetalType | "")}
+          className="rounded-full border border-brand-300 px-4 py-2 text-sm"
+        >
+          <option value="">All metals</option>
+          {METALS.map((m) => (
+            <option key={m} value={m}>{titleCase(m)}</option>
+          ))}
+        </select>
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm text-ink-900/60">$</span>
+          <input
+            type="number"
+            min={0}
+            inputMode="decimal"
+            value={minPrice}
+            onChange={(e) => setMinPrice(e.target.value)}
+            placeholder="Min"
+            aria-label="Minimum price"
+            className="w-20 rounded-full border border-brand-300 px-3 py-2 text-sm"
+          />
+          <span className="text-sm text-ink-900/40">–</span>
+          <span className="text-sm text-ink-900/60">$</span>
+          <input
+            type="number"
+            min={0}
+            inputMode="decimal"
+            value={maxPrice}
+            onChange={(e) => setMaxPrice(e.target.value)}
+            placeholder="Max"
+            aria-label="Maximum price"
+            className="w-20 rounded-full border border-brand-300 px-3 py-2 text-sm"
+          />
+        </div>
+        <select
+          value={sort}
+          onChange={(e) => setSort(e.target.value as SortValue)}
+          className="rounded-full border border-brand-300 px-4 py-2 text-sm"
+        >
+          {SORT_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>{opt.label}</option>
+          ))}
+        </select>
+      </div>
+
+      {chips.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          {chips.map((chip) => (
+            <button
+              key={chip.key}
+              type="button"
+              onClick={chip.onClear}
+              className="inline-flex items-center gap-1 rounded-full bg-brand-100 px-3 py-1 text-xs text-ink-900/80 hover:bg-brand-200"
+            >
+              {chip.label}
+              <CloseIcon className="h-3 w-3" />
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={clearAllFilters}
+            className="text-xs font-medium text-brand-600 hover:underline"
+          >
+            Clear all
+          </button>
+        </div>
+      )}
+
+      {isLoading && !hasLoaded ? (
+        <div className="mt-8">
+          <ProductGridSkeleton count={8} />
+        </div>
+      ) : (
+        <>
+          <p className="mt-6 text-sm text-ink-900/60">
+            {total === 0 ? "No products found" : `${total} product${total === 1 ? "" : "s"} found`}
+          </p>
+          {products.length === 0 ? (
+            <p className="mt-10 text-center text-ink-900/60">No products match your filters.</p>
+          ) : (
+            <>
+              <div className="mt-4 grid grid-cols-2 gap-6 sm:grid-cols-3 lg:grid-cols-4">
+                {products.map((product) => (
+                  <ProductCard key={product.id} product={product} />
+                ))}
+              </div>
+              <Pagination page={page} pageSize={PAGE_SIZE} total={total} onPageChange={setPage} />
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

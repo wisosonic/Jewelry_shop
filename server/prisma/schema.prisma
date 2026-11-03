@@ -1,0 +1,477 @@
+// Money is stored as integer minor units (cents) rather than DECIMAL/FLOAT:
+// SQLite has no native DECIMAL type in Prisma, and floats introduce rounding
+// error. Integer cents works identically on SQLite today and MySQL later.
+//
+// Role/status/category/metalType fields are plain String (not Prisma enum):
+// SQLite has no native enum support in Prisma, so using String keeps the
+// schema identical across both providers. Allowed values are validated with
+// zod at the API boundary (see src/modules/*/*.schema.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  // Optional as of the phone-based OTP registration flow - self-registration
+  // requires `phone` instead (validated by zod at the API boundary, not
+  // here, since an admin-created user via users.service.ts's createUser()
+  // is allowed to have neither). Still `@unique` - SQLite allows any number
+  // of NULLs under a unique index, so multiple phoneless/emailless users
+  // coexist fine.
+  email         String?   @unique
+  passwordHash  String
+  name          String
+  phone         String?   @unique
+  address       String?
+  // CUSTOMER | ADMIN | SUPER_ADMIN - see server/src/utils/roles.ts. SUPER_ADMIN
+  // is a single, non-assignable role (seeded, never grantable via the API) with
+  // every ADMIN permission plus the ability to manage other ADMIN/SUPER_ADMIN accounts.
+  role          String    @default("CUSTOMER")
+  // Whether this account has completed OTP phone verification. New
+  // self-registrations start `false` (see auth.service.ts's registerUser())
+  // and can log in with limited access (browse only, no orders - enforced
+  // in orders.service.ts's createOrder()) until verified. Defaults `true`
+  // so existing/admin-created users are never affected - this flag is
+  // specifically about phone verification, not a general account-suspension
+  // switch.
+  isVerified    Boolean   @default(true)
+  // Set on every successful password login (auth.service.ts's loginUser())
+  // - not on registration itself, and not on a silent refresh-token
+  // rotation, since neither is really "logging in" again. `null` means the
+  // account has never logged in since it was created (or was admin-created
+  // and hasn't logged in yet).
+  lastLoginAt   DateTime?
+  // When the "your account will be deleted soon" warning was sent to a
+  // still-unverified account (see modules/accountCleanup) - `null` until
+  // then. Prevents the daily cleanup job from re-sending the warning every
+  // day between when it first qualifies and when it's actually deleted.
+  // Cleared implicitly by the fact that this only ever matters pre-deletion
+  // or pre-verification - a verified account's warning history is moot.
+  deletionWarningSentAt DateTime?
+  // Private admin-only note about this customer (support context, delivery
+  // preferences, etc.) - never returned to the customer themselves. See
+  // users.service.ts's role-gated `publicSelect`/`adminSelect`: this column
+  // is only included in a response when the requester is an ADMIN, and
+  // users.controller.ts strips it from a non-admin's update body the same
+  // way it already strips a smuggled `role` field.
+  adminNotes    String?
+  // Admin-only master kill switch for the notification system's email/SMS
+  // delivery (see modules/notifications/inAppNotifications.service.ts's
+  // notifyAdminsOfEvent()) - even when a NotificationPreference row
+  // below has `channel` set to EMAIL/SMS for a given event, nothing
+  // external is ever sent unless this is also true. Defaults `false`, i.e.
+  // an admin gets in-app notifications only until they explicitly opt in
+  // to also being messaged. Meaningless for a CUSTOMER-role account, which
+  // never has messaging preferences of its own (see the in-app-only rule
+  // in CLAUDE.md).
+  notificationMessagingEnabled Boolean @default(false)
+  // Admin-set (Admin -> Users -> a user's detail page or the list's quick
+  // action), gated ONLY on order placement - orders.service.ts's
+  // createOrder() throws 403 when true, the same shape as the isVerified
+  // check right above it in that function. Deliberately does NOT affect
+  // login, browsing, or profile management (a blocked customer can still
+  // do everything except buy) - this is not a general account-suspension
+  // switch either, same distinction isVerified already draws for itself.
+  isBlocked     Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  orders        Order[]
+  refreshTokens RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  wishlistItems WishlistItem[]
+  reviews       Review[]
+  otpCodes      OtpCode[]
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+}
+
+// An in-app notification (see modules/notifications/inAppNotifications.*) -
+// distinct from NotificationService (modules/notifications/notification.service.ts),
+// which is the *email* delivery adapter. Every notification-worthy event in
+// this app creates one of these rows and, if the recipient is connected,
+// pushes it live over Socket.IO (see src/realtime.ts) - the row is what
+// still shows up in `GET /notifications` for someone who wasn't online at
+// the time. `type` is a plain String (not a Prisma enum, per this schema's
+// usual convention): ORDER_CONFIRMED | ORDER_STATUS_UPDATED |
+// PASSWORD_CHANGED | NEW_LOGIN | PROFILE_UPDATED | ACCOUNT_DELETION_WARNING |
+// WISHLIST_BACK_IN_STOCK | PROMOTION go to CUSTOMER-role users; USER_SIGNUP |
+// LOW_STOCK | CRITICAL_ERROR | NEW_ORDER go to ADMIN-role users. `type` is
+// finer-grained than the *preference category* a user actually toggles
+// on/off (see NotificationPreference below and CATEGORY_BY_TYPE in
+// inAppNotifications.schema.ts) - e.g. ORDER_CONFIRMED and
+// ORDER_STATUS_UPDATED both fall under one "order updates" toggle.
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  message   String
+  // Optional client-side route to navigate to on click (e.g. "/orders/<id>")
+  // - null when there's nowhere specific to go (e.g. a broadcast promotion).
+  link      String?
+  isRead    Boolean   @default(false)
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+}
+
+// One row per (user, preference category) - lazily created only when the
+// user actually edits their preferences (AdminNotifications.tsx for admins,
+// the preferences panel on Notifications.tsx for everyone else), never
+// seeded. A missing row means the defaults below (enabled, no external
+// channel) - see inAppNotifications.service.ts's `createNotification()`
+// (the universal enforcement point for `enabled`, for every user) and
+// `notifyAdminsOfEvent()` (which additionally reads `channel` - only ever
+// meaningful for the admin-only event categories; a CUSTOMER-role row's
+// `channel` is always "NONE", since regular users stay in-app-only - see
+// the notification-system invariant in CLAUDE.md).
+model NotificationPreference {
+  id        String  @id @default(cuid())
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eventType String  // see ADMIN_EVENT_TYPES/CUSTOMER_EVENT_TYPES in inAppNotifications.schema.ts
+  // false = don't notify this user for this category at all, not even
+  // in-app - distinct from `channel` below, which only controls the
+  // *external* leg for admin categories.
+  enabled   Boolean @default(true)
+  // NONE | EMAIL | SMS - only actually used to send externally when
+  // `enabled` is true here AND `User.notificationMessagingEnabled` is true.
+  // Always "NONE" for a customer category.
+  channel   String  @default("NONE")
+
+  @@unique([userId, eventType])
+}
+
+// A one-time 5-digit numeric code sent via SMS (see modules/sms/sms.service.ts)
+// to verify a new registration's phone number. Hashed at rest and single-use
+// via consumedAt, like PasswordResetToken - but deliberately does NOT expire
+// (a product decision: a shopper can activate their account whenever they
+// get around to it) - see auth.service.ts's issueAndSendOtp()/verifyOtp().
+// `attempts` caps wrong-guess brute-forcing of the 5-digit space per code
+// (this matters more without an expiry, since a code otherwise stays valid
+// indefinitely until consumed or superseded by a resend); resend abuse is
+// separately guarded by a per-account cooldown plus a dedicated rate
+// limiter on the /resend-otp route itself (middleware/rateLimit.ts).
+model OtpCode {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash   String
+  consumedAt DateTime?
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// Mirrors RefreshToken's shape/security model: a random opaque token is
+// emailed to the user, only its SHA-256 hash is persisted, and it's
+// single-use (consumedAt) and short-lived (expiresAt) - see
+// auth.service.ts's requestPasswordReset()/resetPassword().
+model PasswordResetToken {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+
+  @@index([userId])
+}
+
+model Product {
+  id                String      @id @default(cuid())
+  sku               String      @unique
+  name              String
+  description       String
+  productType       String      @default("JEWELRY") // JEWELRY | BULLION
+  category          String      // RING | NECKLACE | BRACELET | EARRING (JEWELRY) | BAR | COIN (BULLION)
+  metalType         String      // GOLD | SILVER
+  purity            Float       // e.g. 0.75 for 18k gold, 0.999 for fine silver
+  weightGrams       Float
+  makingChargeCents Int         @default(0)
+  currentPriceCents Int         @default(0)
+  stockQuantity     Int         @default(0)
+  imageUrl          String?
+  isActive          Boolean     @default(true)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  orderItems        OrderItem[]
+  wishlistItems     WishlistItem[]
+  reviews           Review[]
+}
+
+// A user can wishlist a given product at most once - re-clicking the heart
+// toggle removes it rather than creating a duplicate row.
+model WishlistItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId])
+  @@index([userId])
+}
+
+// One review per user per product (re-submitting updates it rather than
+// adding a second row - see reviews.service.ts). Not restricted to
+// verified purchasers today; that's a reasonable future tightening, not a
+// correctness invariant of the current design.
+model Review {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rating    Int      // 1-5, enforced by zod at the API boundary, not the DB
+  comment   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, productId])
+  @@index([productId])
+}
+
+model MetalPrice {
+  id                String   @id @default(cuid())
+  metalType         String   // GOLD | SILVER
+  pricePerGramCents Int
+  currency          String   @default("USD")
+  source            String   @default("metals.dev")
+  fetchedAt         DateTime @default(now())
+
+  @@index([metalType, fetchedAt])
+}
+
+model Settings {
+  id  Int @id @default(1)
+  // Flat, fixed surcharge on top of the spot metal price, quoted per troy
+  // ounce (the conventional unit gold/silver is priced in) and stored as
+  // integer cents per the money-is-integer-cents rule - not a percentage,
+  // and not per gram. Positive = markup, negative = discount.
+  // commissionSelling applies when a customer buys from the store (see
+  // OrderItem below); commissionBuying would apply if the store ever bought
+  // metal back from a customer, which isn't part of the order flow today.
+  // pricing.ts converts to a per-gram amount (dividing by
+  // GRAMS_PER_TROY_OUNCE) before multiplying by a product's weight.
+  //
+  // Split by metal type (Gold/Silver) - each product already has a definite
+  // `metalType`, and gold vs. silver commonly carry different real-world
+  // markups (gold is a higher-value, lower-volume trade; silver's spot
+  // price is much lower, so the same flat per-troy-ounce commission would
+  // be a wildly different fraction of the item's value). This replaced a
+  // single global rate that used to apply uniformly to both metals -
+  // `products.service.ts`'s `sellingCommissionForMetal()`/
+  // `buyingCommissionForMetal()` are the one place that picks the right
+  // field for a given `Product.metalType` (or `MetalPrice.metalType`);
+  // don't hardcode a `"GOLD" ? ... : ...` a second time anywhere else.
+  commissionSellingGoldCentsPerTroyOunce   Int      @default(5000)
+  commissionSellingSilverCentsPerTroyOunce Int      @default(5000)
+  commissionBuyingGoldCentsPerTroyOunce    Int      @default(-3000)
+  commissionBuyingSilverCentsPerTroyOunce  Int      @default(-3000)
+  currency                           String   @default("USD")
+  // Display-only currency conversion - see the "LBP is a display
+  // conversion, never stored" domain invariant in CLAUDE.md. Everything is
+  // still priced/stored/snapshotted in USD cents; this is purely how many
+  // Lebanese pounds one US dollar converts to for the client's currency
+  // toggle (client/src/lib/currency.ts).
+  usdToLbpRate                  Float    @default(89500)
+  // Global stockQuantity threshold (inclusive) at/below which a product
+  // shows up in the admin low-stock alert list. One store-wide number, not
+  // per-product, to keep this simple - see dashboard.service.ts.
+  lowStockThreshold              Int      @default(5)
+  // A deliberate, admin-controlled bypass for OTP phone verification - see
+  // auth.service.ts's verifyOtp(). When set (a 5-digit string), submitting
+  // this exact code verifies ANY user's account, skipping that user's own
+  // generated code, its attempts cap, and consuming/invalidating whatever
+  // individual code was pending - entirely separate from the normal
+  // per-user OTP flow. Intended for local testing/demos and customer
+  // support (e.g. SMS delivery failed) where checking server logs or
+  // waiting on Twilio isn't practical. `null`/empty disables it, which is
+  // the default and should be the norm outside those situations, since a
+  // known universal code is a real, intentional weakening of phone
+  // verification for every account at once for as long as it's set.
+  universalOtpCode               String?
+  // Global failed-guess counter for the universalOtpCode bypass above -
+  // incremented on every wrong code submitted anywhere in the app while a
+  // universal code is set (see auth.service.ts's verifyOtp()). Exists
+  // because the per-account OtpCode.attempts cap can be trivially reset by
+  // an attacker just registering a fresh account, but this counter can't -
+  // it's global, not per-user. Locks the bypass out entirely (falling
+  // through to each account's own normal per-code flow, which still works
+  // for a genuine user) for a cooldown once the threshold is hit.
+  universalOtpFailedAttempts     Int      @default(0)
+  universalOtpLockedUntil        DateTime?
+  // Master switch for the registration OTP flow, distinct from
+  // universalOtpCode above (which bypasses entering *a* code, but still
+  // requires the verify-otp step to happen). When false, auth.service.ts's
+  // registerUser() skips issuing/sending an OTP entirely and creates the
+  // account already isVerified: true - the account never enters a pending
+  // state at all. Defaults true (today's existing behavior, unchanged).
+  // Only affects new registrations from the moment this is set - it does
+  // not retroactively verify accounts already pending from before the
+  // toggle changed.
+  otpVerificationEnabled        Boolean  @default(true)
+  // Master switch for the automatic metal-price refresh (the recurring cron
+  // job AND the best-effort fetch on server boot - see
+  // metals.scheduler.ts's startMetalsScheduler()). Defaults true (today's
+  // existing behavior, unchanged). Deliberately does NOT gate the admin's
+  // manual "refresh now" button (POST /metals/refresh) - that's an explicit
+  // admin action, not part of "the schedule", and always calls
+  // refreshMetalPrices() directly regardless of this flag. Both the
+  // automatic and manual paths still share the same rate-limit guard inside
+  // refreshMetalPrices() itself (see the domain invariant in CLAUDE.md) -
+  // this flag only decides whether the automatic paths ever call it, not
+  // how that call behaves once made.
+  metalPriceScheduleEnabled     Boolean  @default(true)
+  // How often, in minutes, the automatic metal-price refresh runs - the
+  // single admin-editable source of truth for BOTH how often
+  // metals.scheduler.ts's tick attempts a refresh AND the minimum gap
+  // refreshMetalPrices() enforces between any two fetches (manual or
+  // automatic) - see that function's doc comment. This replaced two
+  // previously separate, env-only, restart-required settings
+  // (METALS_REFRESH_CRON and METALS_MIN_REFRESH_INTERVAL_MINUTES) - a
+  // deliberate simplification so an admin has one number that means
+  // exactly what it says, with no hidden floor underneath it, and changing
+  // it takes effect on the scheduler's very next tick with no restart.
+  // Bounded 1-1440 (see settings.schema.ts) - default 60 matches the old
+  // env var's default.
+  metalPriceRefreshFrequencyMinutes Int @default(60)
+  updatedAt                     DateTime @updatedAt
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  // Nullable, with onDelete: SetNull - the one exception to every other
+  // User relation in this schema cascade-deleting. Deleting a user must
+  // never destroy their order history (a financial/audit record), so
+  // their orders survive, detached ("orphaned") rather than deleted -
+  // users.service.ts's deleteUser() relies on this to succeed
+  // unconditionally, whether or not the target has ever ordered anything.
+  // getOrder()/cancelOrder()'s ownership checks (`order.userId !==
+  // requester.id`) already correctly deny every non-admin once userId is
+  // null - nobody but an admin can act on an orphaned order.
+  userId          String?
+  user            User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  status          String      @default("PENDING") // PENDING | CONFIRMED | SHIPPED | DELIVERED | CANCELLED
+  subtotalCents   Int
+  totalCents      Int
+  currency        String      @default("USD")
+  shippingAddress String?
+  // Set by payment.service's PaymentProvider adapter. No real gateway is
+  // wired up yet, so this is always "manual"/"DEFERRED" for now.
+  paymentProvider  String?
+  paymentStatus    String      @default("DEFERRED") // DEFERRED | SUCCEEDED | FAILED
+  paymentReference String?
+  // Manually recorded by an admin once payment is actually collected
+  // out-of-band (see orders.schema.ts's PAYMENT_METHODS) - distinct from
+  // `paymentProvider` above, which is owned by the PaymentProvider adapter
+  // for a future real gateway integration, not admin-editable.
+  paymentMethod    String?
+  // The currency the customer actually paid in, as manually recorded by an
+  // admin (USD | LBP - see orders.schema.ts's PAYMENT_CURRENCIES). This is
+  // NOT the same thing as the storefront's display-only LBP conversion (see
+  // the "LBP is a display-only currency conversion" domain invariant in
+  // CLAUDE.md): no LBP amount is computed or stored here, only a currency
+  // *label* for the admin's own bookkeeping. `subtotalCents`/`totalCents`
+  // above remain USD cents regardless of this field's value.
+  paymentCurrency  String      @default("USD")
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  items           OrderItem[]
+
+  @@index([userId])
+}
+
+model OrderItem {
+  id                             String  @id @default(cuid())
+  orderId                        String
+  order                          Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId                      String
+  product                        Product @relation(fields: [productId], references: [id])
+  // Snapshots below are captured at purchase time and never recomputed,
+  // so historical orders stay consistent even if prices/rates change later.
+  productNameSnapshot            String
+  skuSnapshot                    String
+  quantity                       Int
+  unitPriceCentsSnapshot              Int
+  metalPricePerGramCentsSnapshot      Int
+  commissionCentsPerTroyOunceSnapshot Int
+  lineTotalCents                      Int
+
+  @@index([orderId])
+}
+
+// Singleton (id=1, same pattern as Settings) holding the storefront's public
+// contact details and the manually-toggled emergency/special-event override
+// banner. Regular weekly hours live in BusinessHours (one row per day) and
+// dated exceptions live in BusinessHoliday - both kept separate rather than
+// as JSON blobs here, so each day/exception is independently queryable and
+// editable, consistent with how the rest of this schema avoids blob columns.
+model BusinessInfo {
+  id      Int     @id @default(1)
+  address String?
+  phone   String?
+  // When true, `overrideMessage` is shown as a warning banner on every page
+  // (client/src/components/layout/OverrideBanner.tsx) instead of the
+  // regular BusinessHours/BusinessHoliday schedule - for a one-off closure
+  // or special event, not a recurring schedule change (use BusinessHoliday
+  // for anything date-scoped/recurring-adjacent instead).
+  overrideActive  Boolean  @default(false)
+  overrideMessage String?
+  updatedAt       DateTime @updatedAt
+}
+
+// Exactly 7 rows, one per day of the week (dayOfWeek 0=Sunday .. 6=Saturday,
+// matching JS Date.getDay()) - business.service.ts seeds/upserts all 7
+// together via a single admin form rather than letting rows be created ad
+// hoc, so there's never a missing or duplicate day.
+model BusinessHours {
+  id        String  @id @default(cuid())
+  dayOfWeek Int     @unique
+  isOpen    Boolean @default(true)
+  // "HH:MM" 24-hour local time, validated by business.schema.ts - not a
+  // DateTime, since there's no meaningful date component for a recurring
+  // weekly hour.
+  openTime  String  @default("09:00")
+  closeTime String  @default("18:00")
+}
+
+// A dated exception to the regular BusinessHours schedule (a holiday
+// closure or special hours for a specific date) - distinct from
+// BusinessInfo's overrideActive banner, which is for an unplanned/ad hoc
+// closure rather than a scheduled one.
+model BusinessHoliday {
+  id        String   @id @default(cuid())
+  date      DateTime
+  label     String
+  isClosed  Boolean  @default(true)
+  openTime  String?
+  closeTime String?
+  createdAt DateTime @default(now())
+
+  @@index([date])
+}
